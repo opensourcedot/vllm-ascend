@@ -20,7 +20,7 @@ import warnings
 from importlib.util import find_spec
 from typing import Any, Final, Literal, Mapping, Optional, Union
 
-import torch
+from vllm.frameworks import current_framework
 import vllm.envs as envs
 from vllm.config import (HfOverrides, ModelConfig, ModelImpl, PoolerConfig,
                          TaskOption, _get_and_verify_dtype,
@@ -39,7 +39,7 @@ def new_init(
     tokenizer: str,
     tokenizer_mode: str,
     trust_remote_code: bool,
-    dtype: Union[str, torch.dtype],
+    dtype: Union[str, current_framework.dtype],
     seed: int,
     hf_config_path: Optional[str] = None,
     allowed_local_media_path: str = "",

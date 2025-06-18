@@ -19,13 +19,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import numpy as np
-import torch
-from torch.nn.functional import scaled_dot_product_attention
+from vllm.frameworks import current_framework
+from vllm.frameworks.nn.functional import scaled_dot_product_attention
 
-try:
-    import torch_npu  # noqa: F401
-except ImportError:
-    print("Failed to import torch_npu.")
+from vllm_ascend.frameworks import npu
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer,
@@ -42,28 +39,28 @@ from vllm_ascend.worker.model_runner import (
     ModelInputForNPUBuilder, ModelInputForNPUWithSamplingMetadata)
 
 
-def generate_attn_mask(max_seq_len: int, dtype=torch.float16, mask_value=None):
+def generate_attn_mask(max_seq_len: int, dtype=current_framework.float16, mask_value=None):
     # Construct lower triangle matrix.
-    mask_flag = torch.tril(
-        torch.ones((max_seq_len, max_seq_len),
-                   dtype=torch.bool)).view(max_seq_len, max_seq_len)
+    mask_flag = current_framework.tril(
+        current_framework.ones((max_seq_len, max_seq_len),
+                   dtype=current_framework.bool)).view(max_seq_len, max_seq_len)
     # Create upper triangle matrix used to mark mask positions.
     mask_flag = ~mask_flag
     # Currently for fp16 dtype, the mask value should be set to -inf.
     # TODO: Eliminate this part in the future.
     if mask_value is None:
-        if dtype == torch.float16:
-            mask_value = torch.finfo(torch.float32).min
+        if dtype == current_framework.float16:
+            mask_value = current_framework.finfo(current_framework.float32).min
         else:
             mask_value = 1
-    attn_mask = torch.masked_fill(torch.zeros(size=(max_seq_len, max_seq_len)),
+    attn_mask = current_framework.masked_fill(current_framework.zeros(size=(max_seq_len, max_seq_len)),
                                   mask_flag, mask_value).to(dtype)
     return attn_mask
 
 
 class AttentionMaskBuilder:
 
-    def __init__(self, attn_mask: torch.Tensor):
+    def __init__(self, attn_mask: current_framework.Tensor):
         self._seq_len_cached = attn_mask.shape[0]
         self.attn_mask_cache = attn_mask
         self.splitfuse_mask_value = -10000
@@ -71,29 +68,29 @@ class AttentionMaskBuilder:
     @classmethod
     def initialize_from_len(cls,
                             max_seq_len: int,
-                            dtype: torch.dtype = torch.float16,
+                            dtype: current_framework.dtype = current_framework.float16,
                             mask_value: Optional[int] = None):
         return cls(generate_attn_mask(max_seq_len, dtype, mask_value))
 
-    def update_attn_cache(self, seqlen: int, dtype: torch.dtype,
-                          device: torch.device):
+    def update_attn_cache(self, seqlen: int, dtype: current_framework.dtype,
+                          device: current_framework.device):
         if seqlen > self._seq_len_cached or self.attn_mask_cache.dtype != dtype:
             self._seq_len_cached = seqlen
             self.attn_mask_cache = generate_attn_mask(seqlen, dtype)
         if self.attn_mask_cache.device != device:
             self.attn_mask_cache = self.attn_mask_cache.to(device)
 
-    def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype,
-                      device: torch.device):
+    def get_attn_mask(self, max_seq_len: int, dtype: current_framework.dtype,
+                      device: current_framework.device):
         self.update_attn_cache(max_seq_len, dtype, device)
         return self.attn_mask_cache[:max_seq_len, :max_seq_len].contiguous()
 
     def get_decode_attn_mask(
         self,
-        input_lengths: torch.tensor,
+        input_lengths: current_framework.tensor,
         max_s: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        dtype: current_framework.dtype,
+        device: current_framework.device,
     ):
         self.update_attn_cache(max_s, dtype, device)
         return (self.attn_mask_cache.index_select(
@@ -106,7 +103,7 @@ class AttentionMaskBuilder:
         position,
         dtype,
         device,
-    ) -> torch.Tensor:
+    ) -> current_framework.Tensor:
         max_seq_len = max(seq_lens, default=0)
         if max_seq_len <= self._seq_len_cached:
             self.update_attn_cache(max_seq_len, dtype, device)
@@ -118,10 +115,10 @@ class AttentionMaskBuilder:
                 attn_mask *= -10000
             else:
                 attn_mask = self.attn_mask_cache
-            return torch.index_select(attn_mask, dim=0,
+            return current_framework.index_select(attn_mask, dim=0,
                                       index=position)[:, :max_seq_len]
         total_q_len = sum(query_lens)
-        attn_mask = torch.zeros((total_q_len, max_seq_len),
+        attn_mask = current_framework.zeros((total_q_len, max_seq_len),
                                 dtype=dtype,
                                 device="cpu")
 
@@ -172,9 +169,9 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def swap_blocks(
-        src_kv_cache: List[torch.Tensor],
-        dst_kv_cache: List[torch.Tensor],
-        src_to_dst: torch.Tensor,
+        src_kv_cache: List[current_framework.Tensor],
+        dst_kv_cache: List[current_framework.Tensor],
+        src_to_dst: current_framework.Tensor,
     ) -> None:
         src_key_cache, src_value_cache = src_kv_cache[0], src_kv_cache[1]
         dst_key_cache, dst_value_cache = dst_kv_cache[0], dst_kv_cache[1]
@@ -188,8 +185,8 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
-        src_to_dists: torch.Tensor,
+        kv_caches: List[current_framework.Tensor],
+        src_to_dists: current_framework.Tensor,
     ) -> None:
         src_indices = src_to_dists[:, 0]
         dst_indices = src_to_dists[:, 1]
@@ -253,7 +250,7 @@ class AscendMetadata(AttentionMetadata):
     # stored into. E.g., if `slot_mapping` is [35, 2, 17] and the block size
     # is 16, the three tokens are stored in the 3rd slot in block 2, 2nd slot
     # in block 0, and 1st slot in block 1, respectively.
-    slot_mapping: torch.Tensor
+    slot_mapping: current_framework.Tensor
 
     # requests only.
     max_prefill_seq_len: int
@@ -263,10 +260,10 @@ class AscendMetadata(AttentionMetadata):
 
     # (batch_size, max_blocks_per_seq).
     # Block addresses per sequence. (Seq id -> list of physical block)
-    block_tables: Optional[torch.Tensor]
+    block_tables: Optional[current_framework.Tensor]
 
     # seq_lens stored as a tensor.
-    seq_lens_tensor: Optional[torch.Tensor]
+    seq_lens_tensor: Optional[current_framework.Tensor]
 
     # (batch_size,). The sequence length per sequence. Sequence length means
     # the computed tokens + new tokens None if it is a decoding.
@@ -283,7 +280,7 @@ class AscendMetadata(AttentionMetadata):
 
     # Encoder sequence lengths representation
     encoder_seq_lens: Optional[List[int]] = None
-    encoder_seq_lens_tensor: Optional[torch.Tensor] = None
+    encoder_seq_lens_tensor: Optional[current_framework.Tensor] = None
 
     # Maximum sequence length among encoder sequences
     max_encoder_seq_len: Optional[int] = None
@@ -291,12 +288,12 @@ class AscendMetadata(AttentionMetadata):
     # Number of tokens input to encoder
     num_encoder_tokens: Optional[int] = None
 
-    attn_mask: Optional[torch.Tensor] = None
+    attn_mask: Optional[current_framework.Tensor] = None
 
     # Cross-attention memory-mapping data structures: slot mapping
     # and block tables
-    cross_slot_mapping: Optional[torch.Tensor] = None
-    cross_block_tables: Optional[torch.Tensor] = None
+    cross_slot_mapping: Optional[current_framework.Tensor] = None
+    cross_block_tables: Optional[current_framework.Tensor] = None
 
     @property
     def prefill_metadata(self) -> Optional["AscendMetadata"]:
@@ -389,7 +386,7 @@ class AscendMetadata(AttentionMetadata):
 
     def advance_step(self,
                      model_input: "ModelInputForNPUWithSamplingMetadata",
-                     sampled_token_ids: Optional[torch.Tensor],
+                     sampled_token_ids: Optional[current_framework.Tensor],
                      block_size: int,
                      num_seqs: int,
                      num_queries: int,
@@ -585,15 +582,15 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
         block_tables = make_tensor_with_pad(
             self.block_tables,
             pad=0,
-            dtype=torch.int32,
+            dtype=current_framework.int32,
             device=device,
         )
         assert max_query_len > 0, "query_lens: {}".format(query_lens)
 
         assert device is not None
-        slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.int32,
+        slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, current_framework.int32,
                                                device, self.runner.pin_memory)
-        seq_lens_tensor = async_tensor_h2d(seq_lens, torch.int, device,
+        seq_lens_tensor = async_tensor_h2d(seq_lens, current_framework.int, device,
                                            self.runner.pin_memory)
         placeholder_index_maps = {
             modality: placeholder_map.index_map()
@@ -641,8 +638,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
         if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(alibi_slopes,
-                                        dtype=torch.float32,
+            alibi_slopes = current_framework.tensor(alibi_slopes,
+                                        dtype=current_framework.float32,
                                         device="npu")
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
@@ -656,14 +653,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
     def forward(
         self,
         layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        query: current_framework.Tensor,
+        key: current_framework.Tensor,
+        value: current_framework.Tensor,
+        kv_cache: current_framework.Tensor,
         attn_metadata: AscendMetadata,
         attn_type: str = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        output: Optional[current_framework.Tensor] = None,
+    ) -> current_framework.Tensor:
         """Forward pass with Ascend attention.
         Args:
             query: shape = [num_tokens, num_heads * head_size]
@@ -690,7 +687,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value = value.contiguous()
         attn_type = self.attn_type
 
-        output = torch.empty(num_tokens,
+        output = current_framework.empty(num_tokens,
                              self.num_heads,
                              self.head_size,
                              dtype=query.dtype,
@@ -705,12 +702,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             isPrefill = True if attn_metadata.num_prefills > 0 else False
             if isPrefill:
                 assert attn_metadata.prefill_metadata is not None
-                self.seq_lens_tensor_cpu = torch.from_numpy(
+                self.seq_lens_tensor_cpu = current_framework.from_numpy(
                     np.array(attn_metadata.prefill_metadata.seq_lens).astype(
                         np.int32))
             else:
                 assert attn_metadata.decode_metadata is not None
-                self.seq_lens_tensor_cpu = torch.from_numpy(
+                self.seq_lens_tensor_cpu = current_framework.from_numpy(
                     np.array(attn_metadata.decode_metadata.seq_lens).astype(
                         np.int32))
             block_tables = attn_metadata.decode_metadata.block_tables if attn_metadata.decode_metadata else None
@@ -731,7 +728,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 seq_lens_tensor_cpu=self.seq_lens_tensor_cpu)
         else:
             if self.key_cache is not None:
-                torch_npu._npu_reshape_and_cache(key=key,
+                npu._npu_reshape_and_cache(key=key,
                                                  value=value,
                                                  key_cache=self.key_cache,
                                                  value_cache=self.value_cache,
@@ -742,8 +739,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if (attn_metadata.block_tables is None
                         or attn_metadata.block_tables.numel() == 0):
                     if attn_type == AttentionType.ENCODER_ONLY:
-                        # TODO: change to use torch_npu encoder attention op, instead
-                        # of torch sdpa
+                        # TODO: change to use npu encoder attention op, instead
+                        # of current_framework sdpa
                         query = query.movedim(0, query.dim() - 2)
                         key = key.movedim(0, key.dim() - 2)
                         value = value.movedim(0, value.dim() - 2)
@@ -772,10 +769,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         assert attn_metadata.attn_mask is not None
                         mask = attn_metadata.attn_mask
                         assert attn_metadata.prefill_metadata is not None
-                        self.seq_lens_tensor_cpu = torch.from_numpy(
+                        self.seq_lens_tensor_cpu = current_framework.from_numpy(
                             np.array(attn_metadata.prefill_metadata.seq_lens).
                             astype(np.int32))
-                        torch_npu._npu_flash_attention(
+                        npu._npu_flash_attention(
                             query=query,
                             key=key,
                             value=value,
@@ -792,11 +789,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
             elif attn_metadata.decode_metadata:
                 assert self.key_cache is not None
-                self.seq_lens_tensor_cpu = torch.from_numpy(
+                self.seq_lens_tensor_cpu = current_framework.from_numpy(
                     np.array(attn_metadata.decode_metadata.seq_lens).astype(
                         np.int32))
                 block_tables = attn_metadata.decode_metadata.block_tables
-                torch_npu._npu_paged_attention(
+                npu._npu_paged_attention(
                     query=query,
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
@@ -834,8 +831,8 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
         if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(alibi_slopes,
-                                        dtype=torch.float32,
+            alibi_slopes = current_framework.tensor(alibi_slopes,
+                                        dtype=current_framework.float32,
                                         device="npu")
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
@@ -861,14 +858,14 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
     def forward(
         self,
         layer: AttentionLayer,
-        hidden_states_or_q_c: torch.Tensor,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
+        hidden_states_or_q_c: current_framework.Tensor,
+        kv_c_normed: current_framework.Tensor,
+        k_pe: current_framework.Tensor,
+        kv_cache: current_framework.Tensor,
         attn_metadata: AscendMetadata,
         attn_type: str = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        output: Optional[current_framework.Tensor] = None,
+    ) -> current_framework.Tensor:
         """Forward pass with Ascend attention.
         Args:
             hidden_states_or_q_c: shape = [num_tokens, num_heads * head_size]
@@ -925,22 +922,22 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                                                      -1)
             k_nope, value = kv.split([self.qk_nope_head_dim, self.v_head_dim],
                                      dim=-1)
-            k_cache = torch.cat(
+            k_cache = current_framework.cat(
                 [kv_c_normed.view(num_tokens, self.num_kv_heads, -1), k_pe],
                 dim=2)
             k_pe = k_pe.expand(-1, self.num_heads, -1)
-            key = torch.cat([k_nope.view(num_tokens, kv_heads_num, -1), k_pe],
+            key = current_framework.cat([k_nope.view(num_tokens, kv_heads_num, -1), k_pe],
                             dim=2)
         else:
             kv_heads_num = self.num_kv_heads
-            q_nope_t = torch.transpose(q_nope, 0, 1)
-            q_nope_out = torch.bmm(q_nope_t, self.w_kc)
-            q_nope = torch.transpose(q_nope_out, 0, 1)
-            k_cache = torch.cat(
+            q_nope_t = current_framework.transpose(q_nope, 0, 1)
+            q_nope_out = current_framework.bmm(q_nope_t, self.w_kc)
+            q_nope = current_framework.transpose(q_nope_out, 0, 1)
+            k_cache = current_framework.cat(
                 [kv_c_normed.view(num_tokens, self.num_kv_heads, -1), k_pe],
                 dim=2)
 
-        query = torch.cat([q_nope, q_pe], dim=-1).view(num_tokens,
+        query = current_framework.cat([q_nope, q_pe], dim=-1).view(num_tokens,
                                                        self.num_heads, -1)
 
         if kv_cache.numel() > 0:
@@ -951,12 +948,12 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 num_blocks, block_size, self.num_kv_heads,
                 self.qk_rope_head_dim + self.kv_lora_rank)
             slots = attn_metadata.slot_mapping
-            torch_npu._npu_reshape_and_cache_siso(key=k_cache,
+            npu._npu_reshape_and_cache_siso(key=k_cache,
                                                   key_cache=key_cache,
                                                   slot_indices=slots)
 
         if attn_metadata.num_prefills > 0:
-            attn_output = torch.empty(num_tokens,
+            attn_output = current_framework.empty(num_tokens,
                                       self.num_heads,
                                       self.v_head_dim,
                                       dtype=query.dtype,
@@ -967,10 +964,10 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 mask = attn_metadata.attn_mask
                 assert attn_metadata.prefill_metadata is not None
                 assert attn_metadata.prefill_metadata.seq_lens is not None
-                self.seq_lens_tensor_cpu = torch.from_numpy(
+                self.seq_lens_tensor_cpu = current_framework.from_numpy(
                     np.array(attn_metadata.prefill_metadata.seq_lens).astype(
                         np.int32))
-                torch_npu._npu_flash_attention(
+                npu._npu_flash_attention(
                     query=query,
                     key=key,
                     value=value,
@@ -987,17 +984,17 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 )
         elif attn_metadata.decode_metadata:
             assert kv_cache is not None
-            # if torch.empty is used here, the preemptive scheduling case of
+            # if current_framework.empty is used here, the preemptive scheduling case of
             # test_mtp_correctness.py will fail to run.
-            attn_output = torch.randn(
+            attn_output = current_framework.randn(
                 [num_tokens, self.num_heads, self.kv_lora_rank],
                 dtype=query.dtype,
                 device=query.device)
-            self.seq_lens_tensor_cpu = torch.from_numpy(
+            self.seq_lens_tensor_cpu = current_framework.from_numpy(
                 np.array(attn_metadata.decode_metadata.seq_lens).astype(
                     np.int32))
             block_tables = attn_metadata.decode_metadata.block_tables
-            torch_npu._npu_paged_attention_mla(
+            npu._npu_paged_attention_mla(
                 query=query,
                 key_cache=key_cache,
                 num_kv_heads=self.num_kv_heads,
@@ -1007,9 +1004,9 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 context_lens=self.seq_lens_tensor_cpu,
                 mla_vheadsize=self.kv_lora_rank,
                 out=attn_output)
-            attn_output_t = torch.transpose(attn_output, 0, 1)
-            attn_output_t = torch.bmm(attn_output_t, self.w_vc)
-            attn_output = torch.transpose(attn_output_t, 0, 1)
+            attn_output_t = current_framework.transpose(attn_output, 0, 1)
+            attn_output_t = current_framework.bmm(attn_output_t, self.w_vc)
+            attn_output = current_framework.transpose(attn_output_t, 0, 1)
 
         output, _ = self.o_proj(attn_output.reshape(num_tokens, -1))
 

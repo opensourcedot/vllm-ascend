@@ -20,9 +20,9 @@
 import gc
 from typing import Dict, List, Optional
 
-import torch
-import torch.nn as nn
-import torch_npu
+from vllm.frameworks import current_framework
+import vllm.frameworks.nn as nn
+from vllm_ascend.frameworks import npu
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -83,7 +83,7 @@ class NPUWorker(WorkerBase):
                 self.cache_config.cache_dtype]
 
         if self.model_config.trust_remote_code:
-            # note: lazy import to avoid importing torch before initializing
+            # note: lazy import to avoid importing current_framework before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
 
@@ -97,7 +97,7 @@ class NPUWorker(WorkerBase):
 
     def init_device(self):
         if self.device_config.device.type == "npu":
-            self.device = torch.device(f"npu:{self.local_rank}")
+            self.device = current_framework.device(f"npu:{self.local_rank}")
             NPUPlatform.set_device(self.device)
             NPUPlatform.empty_cache()
             self.init_npu_memory = NPUPlatform.mem_get_info()[0]
@@ -114,23 +114,23 @@ class NPUWorker(WorkerBase):
         self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
     def determine_available_memory(self) -> int:
-        kv_caches: Dict[str, torch.Tensor] = {}
+        kv_caches: Dict[str, current_framework.Tensor] = {}
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         for layer_name, layer_spec in kv_cache_spec.items():
             if isinstance(layer_spec, FullAttentionSpec):
                 # Use an empty tensor instead of `None`` to force Dynamo to pass
                 # it by reference, rather by specializing on the value ``None``.
-                npu_k_cache = torch.tensor([],
+                npu_k_cache = current_framework.tensor([],
                                            dtype=layer_spec.dtype,
                                            device=self.device)
-                npu_v_cache = torch.tensor([],
+                npu_v_cache = current_framework.tensor([],
                                            dtype=layer_spec.dtype,
                                            device=self.device)
                 kv_caches[layer_name] = (npu_k_cache, npu_v_cache)
             else:
                 raise NotImplementedError
 
-        runner_kv_caches: List[torch.Tensor] = []
+        runner_kv_caches: List[current_framework.Tensor] = []
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
@@ -220,18 +220,18 @@ class NPUWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):
-        # Torch profiler. Enabled and configured through env vars:
+        # current_framework profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         torch_profiler_trace_dir)
 
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                export_type=torch_npu.profiler.ExportType.Text,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+            experimental_config = npu.profiler._ExperimentalConfig(
+                export_type=npu.profiler.ExportType.Text,
+                profiler_level=npu.profiler.ProfilerLevel.Level0,
                 msprof_tx=False,
-                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                aic_metrics=npu.profiler.AiCMetrics.AiCoreNone,
                 l2_cache=False,
                 op_attr=False,
                 data_simplification=False,
@@ -239,16 +239,16 @@ class NPUWorker(WorkerBase):
                 gc_detect_threshold=None,
             )
 
-            return torch_npu.profiler.profile(
+            return npu.profiler.profile(
                 activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
+                    npu.profiler.ProfilerActivity.CPU,
+                    npu.profiler.ProfilerActivity.NPU,
                 ],
                 with_stack=True,
                 profile_memory=True,
                 with_modules=True,
                 experimental_config=experimental_config,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                on_trace_ready=npu.profiler.tensorboard_trace_handler(
                     torch_profiler_trace_dir))
         else:
             return None

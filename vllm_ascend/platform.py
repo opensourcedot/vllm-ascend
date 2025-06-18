@@ -19,8 +19,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
-import torch
-import torch_npu  # noqa: F401
+from vllm.frameworks import current_framework 
 import vllm.envs as envs
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
@@ -56,7 +55,7 @@ class NPUPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "npu"
     device_type: str = "npu"
-    simple_compile_backend: str = "eager"  # Disable torch.compile()
+    simple_compile_backend: str = "eager"  # Disable current_framework.compile()
     ray_device_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
     dispatch_key: str = "PrivateUse1"
@@ -83,7 +82,7 @@ class NPUPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        return torch.npu.get_device_name(device_id)
+        return current_framework.npu.get_device_name(device_id)
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
@@ -91,23 +90,23 @@ class NPUPlatform(Platform):
 
     @classmethod
     def inference_mode(cls):
-        return torch.inference_mode()
+        return current_framework.inference_mode()
 
     @classmethod
-    def set_device(cls, device: torch.device):
-        torch.npu.set_device(device)
+    def set_device(cls, device: current_framework.device):
+        current_framework.npu.set_device(device)
 
     @classmethod
     def empty_cache(cls):
-        torch.npu.empty_cache()
+        current_framework.npu.empty_cache()
 
     @classmethod
     def synchronize(cls):
-        torch.npu.synchronize()
+        current_framework.npu.synchronize()
 
     @classmethod
     def mem_get_info(cls) -> Tuple[int, int]:
-        return torch.npu.mem_get_info()
+        return current_framework.npu.mem_get_info()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -172,10 +171,10 @@ class NPUPlatform(Platform):
 
     @classmethod
     def get_current_memory_usage(cls,
-                                 device: Optional[torch.types.Device] = None
+                                 device: Optional[current_framework.types.Device] = None
                                  ) -> float:
-        torch.npu.reset_peak_memory_stats(device)
-        return torch.npu.max_memory_allocated(device)
+        current_framework.npu.reset_peak_memory_stats(device)
+        return current_framework.npu.max_memory_allocated(device)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

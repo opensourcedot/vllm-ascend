@@ -21,14 +21,11 @@ import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-import torch
+from vllm.frameworks import current_framework
 from acl.rt import memcpy  # type: ignore # noqa: F401
 from vllm.logger import logger
 
-try:
-    import torch_npu  # noqa: F401
-except ImportError:
-    print("Failed to import torch_npu.")
+from vllm_ascend.frameworks import npu
 
 from vllm.utils import is_pin_memory_available
 
@@ -81,7 +78,7 @@ HandleType = Tuple[int, int, int, int]
 class AllocationData:
     handle: HandleType
     tag: str
-    cpu_backup_tensor: Optional[torch.Tensor] = None
+    cpu_backup_tensor: Optional[current_framework.Tensor] = None
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
@@ -95,9 +92,9 @@ def unmap_and_release(allocation_handle: HandleType) -> None:
 def get_pluggable_allocator(
     python_malloc_fn: Callable[[tuple[int, int, int, int]], None],
     python_free_func: Callable[[int], tuple[int, int, int, int]]
-) -> torch_npu.npu.memory.NPUPluggableAllocator:
+) -> npu.npu.memory.NPUPluggableAllocator:
     init_module(python_malloc_fn, python_free_func)
-    new_alloc = torch_npu.npu.memory.NPUPluggableAllocator(
+    new_alloc = npu.npu.memory.NPUPluggableAllocator(
         lib_name, 'my_malloc', 'my_free')
     return new_alloc
 
@@ -107,8 +104,8 @@ def use_memory_pool_with_allocator(
         python_malloc_fn: Callable[[tuple[int, int, int, int]], None],
         python_free_func: Callable[[int], tuple[int, int, int, int]]):
     new_alloc = get_pluggable_allocator(python_malloc_fn, python_free_func)
-    mem_pool = torch_npu.npu.memory.MemPool(new_alloc._allocator)
-    with torch_npu.npu.memory.use_mem_pool(mem_pool):
+    mem_pool = npu.npu.memory.MemPool(new_alloc._allocator)
+    with npu.npu.memory.use_mem_pool(mem_pool):
         yield mem_pool, new_alloc
 
 
@@ -201,9 +198,9 @@ class CaMemAllocator:
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(
+                cpu_backup_tensor = current_framework.empty(
                     size_in_bytes,
-                    dtype=torch.uint8,
+                    dtype=current_framework.uint8,
                     device='cpu',
                     pin_memory=is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
@@ -260,7 +257,7 @@ class CaMemAllocator:
             # see https://github.com/pytorch/pytorch/issues/146431 .
             self.allocator_and_pools[tag] = data
             yield
-            # PyTorch's bug, calling torch.cuda.empty_cache() will error
+            # PyTorch's bug, calling current_framework.cuda.empty_cache() will error
             # when using pluggable allocator, see
             # https://github.com/pytorch/pytorch/issues/145168 .
             # if we have some memory allocated and then freed,
@@ -269,7 +266,7 @@ class CaMemAllocator:
             # during weight loading and kv cache creation, where we only
             # allocate memory.
             # TODO: we need to find a way to release the memory,
-            # i.e. calling torch.cuda.empty_cache()
+            # i.e. calling current_framework.cuda.empty_cache()
             self.current_tag = old_tag
 
     def get_current_usage(self) -> int:

@@ -16,8 +16,8 @@
 #
 from typing import Optional
 
-import torch
-from torch.distributed import ProcessGroup
+from vllm.frameworks import current_framework
+from vllm.frameworks.distributed import ProcessGroup
 from vllm.distributed.device_communicators.base_device_communicator import \
     DeviceCommunicatorBase
 
@@ -26,10 +26,10 @@ class NPUCommunicator(DeviceCommunicatorBase):
 
     def __init__(self,
                  cpu_group: ProcessGroup,
-                 device: Optional[torch.device] = None,
+                 device: Optional[current_framework.device] = None,
                  device_group: Optional[ProcessGroup] = None,
                  unique_name: str = ""):
         super().__init__(cpu_group, device, device_group, unique_name)
         # TODO(hz): Refer to CudaCommunicator's implementation to integrate PyHcclCommunicator
         # init device according to rank
-        self.device = torch.npu.current_device()
+        self.device = current_framework.npu.current_device()

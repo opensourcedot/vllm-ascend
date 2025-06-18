@@ -16,8 +16,7 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from vllm-project/vllm/vllm/worker/worker.py
 #
-import torch
-import torch_npu  # noqa: F401
+from vllm.frameworks import current_framework
 from packaging.version import Version
 from vllm.logger import logger
 
@@ -41,7 +40,7 @@ def find_hccl_library() -> str:
     """
     We either use the library file specified by the `HCCL_SO_PATH`
     environment variable, or we find the library file brought by PyTorch.
-    After importing `torch`, `libhccl.so` can be
+    After importing `current_framework`, `libhccl.so` can be
     found by `ctypes` automatically.
     """
     so_file = envs.HCCL_SO_PATH
@@ -51,7 +50,7 @@ def find_hccl_library() -> str:
         logger.info("Found hccl from environment variable HCCL_SO_PATH=%s",
                     so_file)
     else:
-        if torch.version.cann is not None:
+        if current_framework.version.cann is not None:
             so_file = "libhccl.so"
         else:
             raise ValueError("HCCL only supports Ascend NPU backends.")
@@ -62,20 +61,20 @@ def find_hccl_library() -> str:
 _current_stream = None
 
 
-def current_stream() -> torch.npu.Stream:
+def current_stream() -> current_framework.npu.Stream:
     """
-    replace `torch.npu.current_stream()` with `vllm.utils.current_stream()`.
-    it turns out that `torch.npu.current_stream()` is quite expensive,
+    replace `current_framework.npu.current_stream()` with `vllm.utils.current_stream()`.
+    it turns out that `current_framework.npu.current_stream()` is quite expensive,
     as it will construct a new stream object at each call.
-    here we patch `torch.npu.set_stream` to keep track of the current stream
-    directly, so that we can avoid calling `torch.npu.current_stream()`.
+    here we patch `current_framework.npu.set_stream` to keep track of the current stream
+    directly, so that we can avoid calling `current_framework.npu.current_stream()`.
 
     """
     global _current_stream
     if _current_stream is None:
         # when this function is called before any stream is set,
         # we return the default stream.
-        _current_stream = torch.npu.current_stream()
+        _current_stream = current_framework.npu.current_stream()
     return _current_stream
 
 

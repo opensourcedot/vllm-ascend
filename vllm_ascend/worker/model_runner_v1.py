@@ -23,8 +23,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
 import numpy.typing as npt
-import torch
-import torch.nn as nn
+from vllm.frameworks import current_framework
+import vllm.frameworks.nn as nn
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
@@ -60,7 +60,7 @@ else:
 
 class NPUModelRunner:
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(self, vllm_config: VllmConfig, device: current_framework.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.lora_config = vllm_config.lora_config
@@ -116,9 +116,9 @@ class NPUModelRunner:
 
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
-        self.kv_caches: List[torch.Tensor] = []
+        self.kv_caches: List[current_framework.Tensor] = []
         # req_id -> (input_id -> encoder_output)
-        self.encoder_cache: Dict[str, Dict[int, torch.Tensor]] = {}
+        self.encoder_cache: Dict[str, Dict[int, current_framework.Tensor]] = {}
 
         # Request states.
         self.requests: Dict[str, CachedRequestState] = {}
@@ -132,11 +132,11 @@ class NPUModelRunner:
             vocab_size=self.model_config.get_vocab_size(),
         )
 
-        self.input_ids = torch.zeros(self.max_num_tokens,
-                                     dtype=torch.int32,
+        self.input_ids = current_framework.zeros(self.max_num_tokens,
+                                     dtype=current_framework.int32,
                                      device=self.device)
-        self.positions = torch.zeros(self.max_num_tokens,
-                                     dtype=torch.int64,
+        self.positions = current_framework.zeros(self.max_num_tokens,
+                                     dtype=current_framework.int64,
                                      device=self.device)
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
@@ -145,7 +145,7 @@ class NPUModelRunner:
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
             # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
+            # with current_framework compile.
             # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
 
             # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
@@ -153,16 +153,16 @@ class NPUModelRunner:
             # identical position IDs, making M-RoPE functionally equivalent to
             # 1D-RoPE.
             # See page 5 of https://arxiv.org/abs/2409.12191
-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
-                                               dtype=torch.int64,
+            self.mrope_positions = current_framework.zeros((3, self.max_num_tokens + 1),
+                                               dtype=current_framework.int64,
                                                device=self.device)
-            self.mrope_positions_cpu = torch.zeros(
+            self.mrope_positions_cpu = current_framework.zeros(
                 (3, self.max_num_tokens + 1),
-                dtype=torch.int64,
+                dtype=current_framework.int64,
                 device="cpu",
                 pin_memory=True)
 
-        self.inputs_embeds = torch.zeros(
+        self.inputs_embeds = current_framework.zeros(
             (self.max_num_tokens, self.hidden_size),
             dtype=self.dtype,
             device=self.device)
@@ -175,29 +175,29 @@ class NPUModelRunner:
         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
         # a faster version of creating a new tensor every time. Thus, we should
         # not make any assumptions about the values in these tensors.
-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
-                                         dtype=torch.int32,
+        self.input_ids_cpu = current_framework.zeros(self.max_num_tokens,
+                                         dtype=current_framework.int32,
                                          device="cpu",
                                          pin_memory=True)
-        self.positions_cpu = torch.zeros(self.max_num_tokens,
-                                         dtype=torch.int64,
+        self.positions_cpu = current_framework.zeros(self.max_num_tokens,
+                                         dtype=current_framework.int64,
                                          device="cpu",
                                          pin_memory=True)
         self.positions_np = self.positions_cpu.numpy()
 
-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
-                                            dtype=torch.int32,
+        self.slot_mapping_cpu = current_framework.zeros(self.max_num_tokens,
+                                            dtype=current_framework.int32,
                                             device="cpu",
                                             pin_memory=True)
         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
 
-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
-                                        dtype=torch.int32,
+        self.seq_lens_cpu = current_framework.zeros(self.max_num_reqs,
+                                        dtype=current_framework.int32,
                                         device="cpu",
                                         pin_memory=True)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
 
-        self.input_positions_cpu = torch.arange(0,
+        self.input_positions_cpu = current_framework.arange(0,
                                                 self.max_num_tokens,
                                                 device="cpu")
 
@@ -260,7 +260,7 @@ class NPUModelRunner:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
             if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
+                generator = current_framework.Generator(device=self.device)
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
@@ -371,7 +371,7 @@ class NPUModelRunner:
         return self.model
 
     def _make_attention_mask(self, seq_lens, query_lens, position,
-                             attn_state) -> torch.Tensor:
+                             attn_state) -> current_framework.Tensor:
         # Chunk Prefill situation.
         if attn_state == AscendAttentionState.ChunkedPrefill:
             return self.attn_mask_builder.get_splitfuse_attn_mask(
@@ -389,7 +389,7 @@ class NPUModelRunner:
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> torch.Tensor:
+    ) -> current_framework.Tensor:
         # Check input valid
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
@@ -418,7 +418,7 @@ class NPUModelRunner:
         cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
                                     num_scheduled_tokens)
         sample_indices = cu_num_tokens - 1
-        sample_indices = torch.from_numpy(sample_indices).to(self.device,
+        sample_indices = current_framework.from_numpy(sample_indices).to(self.device,
                                                              non_blocking=True)
         arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
 
@@ -436,7 +436,7 @@ class NPUModelRunner:
             num_scheduled_tokens)
         seq_lens = self.seq_lens_cpu[:num_reqs]
 
-        query_lens = torch.from_numpy(num_scheduled_tokens)
+        query_lens = current_framework.from_numpy(num_scheduled_tokens)
 
         block_table_indices = (req_indices * self.max_num_blocks_per_req +
                                positions_np // self.block_size)
@@ -475,9 +475,9 @@ class NPUModelRunner:
         # Prepare input_ids
         token_indices = (positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
-        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+        current_framework.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
                            0,
-                           torch.from_numpy(token_indices),
+                           current_framework.from_numpy(token_indices),
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
         # Copy the tensors to the NPU.
         self.input_ids[:total_num_scheduled_tokens].copy_(
@@ -499,8 +499,8 @@ class NPUModelRunner:
     def apply_grammar_bitmask(
         self,
         scheduler_output: "SchedulerOutput",
-        logits: torch.Tensor,
-    ) -> torch.Tensor:
+        logits: current_framework.Tensor,
+    ) -> current_framework.Tensor:
         # Serialization of np.ndarray is much more efficient than a tensor,
         # so we receive it in that format.
         grammar_bitmask = scheduler_output.grammar_bitmask
@@ -534,7 +534,7 @@ class NPUModelRunner:
                 sorted_bitmask[batch_index] = grammar_bitmask[orig_index]
             grammar_bitmask = sorted_bitmask
 
-        grammar_bitmask = torch.from_numpy(grammar_bitmask)
+        grammar_bitmask = current_framework.from_numpy(grammar_bitmask)
 
         # TODO: compatibility with spec decode.
         # NOTE:
@@ -550,12 +550,12 @@ class NPUModelRunner:
         )
         return logits.to(self.device).to(logits_dtype)
 
-    @torch.inference_mode()
+    @current_framework.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, torch.Tensor]:
+    ) -> Union[ModelRunnerOutput, current_framework.Tensor]:
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOuptut if there's no work to do.
@@ -694,8 +694,8 @@ class NPUModelRunner:
         # Cache the dummy encoder outputs.
         self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
 
-    @torch.inference_mode()
-    def _dummy_run(self) -> torch.Tensor:
+    @current_framework.inference_mode()
+    def _dummy_run(self) -> current_framework.Tensor:
         model = self.model
         if self.is_multimodal_model:
             input_ids = None
@@ -753,7 +753,7 @@ class NPUModelRunner:
         # TODO: call maybe_profile_with_lora()
 
         dummy_kv_caches = [
-            torch.tensor((), dtype=torch.float32, device=self.device)
+            current_framework.tensor((), dtype=current_framework.float32, device=self.device)
             for _ in range(self.num_attn_layers)
         ]
 
@@ -788,8 +788,8 @@ class NPUModelRunner:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
-        import torch_npu
-        kv_caches: Dict[str, torch.Tensor] = {}
+        import vllm.frameworks.npu as npu
+        kv_caches: Dict[str, current_framework.Tensor] = {}
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
@@ -809,10 +809,10 @@ class NPUModelRunner:
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                    kv_caches[layer_name] = current_framework.zeros(kv_cache_shape,
                                                         dtype=dtype,
                                                         device=self.device)
-                    torch_npu.npu_format_cast(kv_caches[layer_name], 2)
+                    npu.npu_format_cast(kv_caches[layer_name], 2)
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
